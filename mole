@@ -1,0 +1,368 @@
+#!/bin/sh
+
+# Setting environment variables
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+# Variable declaration
+realpath_available=true
+group=
+start_date=
+end_date=
+on_frequency=false
+default=false
+recursive=false
+mode=
+# Setting line difference to '\n'(used for looping) 
+IFS='
+'
+
+# Function getting the path of current directory based on availability of realpath
+current_directory(){
+    if [ $realpath_available = true ]; then
+        realpath .
+    else
+        echo "$PWD"
+    fi
+}
+
+# Function displayed with -h
+usage(){
+    echo "Usage: mole -h "
+    echo "       mole [-g GROUP] FILE"
+    echo "       mole [-m] [-d] [-r] [FILTERS] [DIRECTORY]"
+    echo "       mole list [-d] [-r] [FILTERS] [DIRECTORY]"
+    echo "Options:"
+    echo "  -h                              Show help message"
+    echo "  -g GROUP                        Assign the opened file to a group"
+    echo "  DIRECTORY                       The directory to search for files"
+    echo "  FILE                            File to open"
+    echo "  -m                              Automatically open the most recently modified file"
+    echo "  -r                              Select opened files also in subdirectories"
+    echo "  -d                              Select opened files with no group assigned to them"
+    echo "  FILTERS                         Select only opened files matching the FILTERS pattern"
+    echo "  FILTERS consists of:"
+    echo "  [-g GROUP1[,GROUP2[,...]]]      Select only opened files matching one of specified groups"
+    echo "  -b DATE                         Select opened files starting from DATE (inclusive), in format yyyy-mm-dd"
+    echo "  -a DATE                         Select opened files up to DATE (inclusive), in format yyyy-mm-dd\n"
+    
+}
+# Function opening a file and if needed appending a group to it
+open_file(){
+    file="$1"
+    group="$2"
+
+    # Getting the absolute path of it, 
+    # if realpath is not available on a machine 
+    # or isn't capable of getting absolute path of non existing file, 
+    # then custom alternative of realpath is used
+    file_path=$(realpath "$file" 2> /dev/null || echo $(eval '
+    first_ch=$(echo "$file" | cut -c 1)
+    if [ "$first_ch" = "/" ]; then
+        echo "$file"
+    elif [ "$first_ch" = "." ]; then
+        dir=$(dirname "$file")
+        relpath=$(basename "$file")
+        while [ ! -d "$dir" ]; do
+            relpath="$(echo "$dir" | awk -F "/" "{print \$NF}")/$relpath"
+            dir=$(echo "$dir" | sed "s/\/[^\/]*$//")
+        done
+        cd "$dir"
+        echo "$(current_directory)/$relpath"
+    else
+        echo "$(current_directory)/$file"
+    fi
+    '))
+
+    # Getting the list of groups of the file
+    group_list=$(awk -v path="$file_path" -F ';' '$1 == path {print $4; exit}' "$MOLE_RC")    
+
+    # Checking if group is already appended to the file
+    if [ -n "$group" -a -n "$group_list" ]; then
+        array=$group_list
+        IFS=','
+        for g in $array; do
+            if [ "$g" = "$group" ]; then
+                group=""
+                break
+            fi
+        done
+    fi
+    # Appending the group to a file in the log file
+    if [ -n "$group" ]; then
+        log_content=$(cat "$MOLE_RC")
+        echo "$log_content" | awk -v new_group="$group" -v path="$file_path" -F ';' '{if($1 == path){print $0 new_group "," }else{print $0}}' > "$MOLE_RC"
+        group="${group},"
+    fi
+    # Recording opening to the log
+    echo "$file_path;$(date +%Y-%m-%d);$(date +%H-%M-%S);${group_list}${group}" >> "$MOLE_RC"
+    # Opening the file 
+    ${EDITOR-${VISUAL-vi}} "$1"
+    # Checking if the file opened successfully(valid editor is set)
+    if [ ! $? -eq 0 ]; then
+        echo "Error: The editor specified wrongly. Cannot open the file. Please change the editor value" >&2
+        exit 1
+    fi
+}
+
+# Function for filtering opening logs
+filters(){
+    file="$1"
+    directory="$2"
+    group="$3"
+    start_date=$4
+    end_date=$5
+
+    # selecting files based on specified directory(if -r is set files from subdirectories are also selected)
+    if [ -n "$directory" ]; then
+        if [ $recursive = true ]; then
+            file=$(echo "$file" | awk -v dir="$directory" -F ';' '{path=$1; sub( /\/[^\/]*$/,"",path ); if(path ~ "^"dir){print}}')  
+        else
+            file=$(echo "$file" | awk -v dir="$directory" -F ';' '{path=$1; sub( /\/[^\/]*$/,"",path ); if(path == dir){print}}')  
+        fi
+    fi
+   
+    # Selecting files based on specified group
+    if [ $default = true ]; then
+        file=$(echo "$file" | awk -F ';' '$4 == "" {print}')
+    elif [ -n "$group" ]; then
+        file=$(echo "$file" | awk -v groups="$group" -F ';' 'BEGIN{split(groups,lgroups,",")}
+            {
+                split($4,file_groups,",")
+                for(i in lgroups){
+                    for(j in file_groups){
+                        if(lgroups[i] == file_groups[j]){
+                            print
+                            next
+                        }
+                    }
+                }
+            }')
+    fi 
+    # Selecting files opened from specific date(inclusive)
+    if [ -n "$start_date" ]; then
+        file=$(echo "$file" | awk -v st_date="$start_date" -F ';' '{if($2 >= st_date){print}}')
+    fi
+    # Selecting files opened until specific date(inclusive)
+    if [ -n "$end_date" ]; then
+        file=$(echo "$file" | awk -v end_date="$end_date" -F ';' '{if($2 <= end_date){print}}')
+    fi
+
+    echo "$file" | eval 'tac 2> /dev/null || awk "{line[NR]=\$0} END {for (i=NR; i>=1; i--) print line[i]}"'
+    
+}
+
+# Function getting the relative path tot he file based on the specified directory
+relative_path(){
+    current_path=$1
+    file_path=$2
+    echo "$file_path" | sed "s|^$current_path/||"
+}
+
+# Checking if thee date argument is in valid format, if not error
+validate_date(){
+    if [ -z $(echo "$1" | grep '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$') ]; then
+        echo "Error: $1 is in wrong format (must be Y-m-d)" >&2           
+        exit 1
+    fi
+}
+
+# Checking if realpath utility is available on this machine
+if [ -z $(realpath . 2> /dev/null) ]; then
+    realpath_available=false
+fi
+
+# Checking if the path to log file exists, if not - error
+if [ -n "$MOLE_RC" ]; then 
+    # Creating the log file, if it doesn't exist
+    if [ ! -f "$MOLE_RC" ]; then 
+        dir_root=$(dirname "$MOLE_RC")
+        mkdir -p "$dir_root" && touch "$MOLE_RC"
+    fi
+else
+    echo "Error: Path to log file is not set" 1>&2
+    exit 1
+fi
+
+
+if [ "$1" = "list" ]; then
+    mode=list
+    shift 1
+fi
+
+if [ "$1" = "secret-log" ]; then
+    mode=secret
+    shift 1
+fi
+
+# Getting all the flags and its values
+while getopts ":hg:a:b:mdr" arg
+do
+    case $arg in 
+        h)
+            usage; exit 0 ;;
+        a)
+            start_date="$OPTARG"
+            validate_date "$start_date"
+            ;;
+        b)
+            end_date="$OPTARG" 
+            validate_date "$end_date"
+            ;;
+        g)
+            group="$OPTARG" ;;
+        m)
+            on_frequency=true ;;
+        d)
+            default=true ;;
+        r)
+            recursive=true ;;
+        :)  
+            eval echo "Error: Missing argument for \${$(expr $OPTIND - 1)}" >&2
+            exit 1 ;;
+        \?) 
+            eval echo "Error: Invalid option \${$(expr $OPTIND - 1)}" >&2
+            echo "Use -h for all the available options"
+            exit 1 ;;
+    esac
+done
+
+# Checking if -g and -d are not set together, if yes - error
+if [ $default = true -a -n "$group" ]; then
+    echo "Error: -g and -d flags cannot be set in the same time" 1>&2
+    exit 1
+fi
+
+# Shifting through command line arguments to get then directory/file
+OPTIND=$(expr $OPTIND - 1)
+shift $OPTIND
+
+# Creating a secret-log
+if [ "$mode" = "secret" ]; then
+    # Getting all the logs from log file and filtering them based on everything except directories
+    file_list=$(awk -F ';' '{print}' "$MOLE_RC")
+    file_list=$(filters "$file_list" "" "$group" "$start_date" "$end_date")
+    # Selecting already filtered files based on directories 
+    selected_files=""
+    for arg in "$@"; do
+        if [ -d "$arg" ]; then
+            added_list=$(filters "$file_list" "$arg" "" "" "")
+            selected_files="$selected_files\n$added_list"
+        else
+            break
+        fi
+    done
+    if [ -n "$selected_files" ]; then
+        file_list=$selected_files
+    fi
+    # Getting uniq file pathes
+    file_list=$(echo "$file_list" | awk -F ';' '{print $1 ";" $2 "_" $3}')
+    unique_files=$(echo "$file_list" | awk -F ';' '{print $1}' | sort -f | uniq )
+
+    # Creating .mole folder if it's not created
+    if [ ! -d "$HOME/.mole" ];then
+        mkdir -p "$HOME/.mole"  
+    fi
+    # Creating secret-log file
+    path="$HOME/.mole/log_${USER}_$(date +%Y-%m-%d_%H-%M-%S).bz2"
+    touch "$path"
+    
+    # For each file path selecting time opening and appending it to secret-log file
+    for fname in $unique_files; do
+        time_list=$(echo "$file_list" | eval 'tac 2> /dev/null || awk "{line[NR]=\$0} END {for (i=NR; i>=1; i--) print line[i]}"' | awk -F ';' -v name="$fname" '$1 == name {printf ";%s", $2}')
+        echo "${fname}${time_list}" | bzip2 >> "$path"
+    done
+
+    exit 0
+fi
+
+# Displaying a list of files with groups in specified directories with some filters
+if [ "$mode" = "list" ]; then
+    if [ -d "$1" -o -z "$1" ]; then
+        directory=$1
+        if [ -z $directory ]; then 
+            directory=$(current_directory)
+        fi
+        # Getting all the content from log file and filtering
+        file_list=$(awk -F ';' '{print}' "$MOLE_RC")
+
+        file_list=$(filters "$file_list" "$directory" "$group" "$start_date" "$end_date" | awk -F ';' '{print $1 ";" $4}')
+
+        # Getting uniq file pathes
+        file_list=$(echo "$file_list" | sort -f | uniq )
+
+        # Finding the longest file/relative path(if -r is set)
+        max=0
+        for line in $(echo "$file_list" | cut -f 1 -d ';'); do
+            file_name=$(relative_path "$directory" "$line") 
+            if [ ${#file_name} -ge $max ]; then
+                max=${#file_name}
+            fi
+        done
+
+        # Adding extra char for a white space
+        max=$(expr $max + 1)
+                
+        for line in $file_list; do
+            file_path=$(echo "$line" | cut -f 1 -d ';')
+            if [ -f "$file_path" ]; then 
+                # Getting relative path from current directory
+                file_name=$(relative_path "$directory" "$file_path") 
+                # Calculating number of spaces and converting it to string
+                spaces=$(expr $max - ${#file_name})
+                spaces=$(printf '%*s' $spaces)
+                # Getting groups for each selected file
+                group_list=$(echo "$line" | cut -f 2 -d ';')
+                # If file hasn't its group then '-' will be printed
+                if [ -z $group_list ]; then 
+                    group_list="-"
+                else
+                    # Deleting last ','
+                    group_list=$(echo "$group_list" | sed 's/,$//')  
+                fi
+                printf '%s:%s%s\n' "$file_name" "$spaces" "$group_list"
+            fi
+        done
+        exit 0
+    else
+        echo "Error: $1 is not a directory" 1>&2 
+        exit 1
+    fi
+fi
+# Opening last opned file or the one opened the most frequently based on directory and filters
+if [ -d "$1" -o -z "$1" ]; then
+    # Getting the directory from the command line
+    directory="$1"
+    if [ -z $directory ]; then
+        # The directory is not set, so it's the current one
+        directory=$(current_directory)
+    fi
+    # Getting all log file content and filtering it
+    file=$(awk -F ';' '{print}' "$MOLE_RC")
+    file=$(filters "$file" "$directory" "$group" "$start_date" "$end_date" | awk -F ';' '{print $1 ";" $4}')
+    # If -m is set, then selecting the most frequent opened file
+    if [ $on_frequency = true ]; then 
+        file=$(echo "$file" | sort | uniq -c | sort -rn | sed 's/^ *[0-9]* //')
+    fi
+    # Getting only file path
+    file=$(echo "$file" | awk -F ';' '{print $1}' )
+    
+    # Going through loop to find existing file to open
+    for f in $file; do
+	    if [ -f "$f" ]; then
+            open_file "$f"
+            exit 0
+        fi
+    done
+    echo "Error: Not a single file is found in the directory $directory with those options"
+    exit 1
+else
+    # If -m, -d, -r, -a, -b are set then argument must be directory
+    if [ "$on_frequency" = true -o "$default" = true -o "$recursive" = true -o -n "$start_date" -o -n "$end_date" ]; then
+        echo "Error: $1 is not a directory" >&2
+        exit 1
+    fi
+    # Opening the file and appending a group to it if it exists
+    open_file "$1" "$group"
+fi
+
+
