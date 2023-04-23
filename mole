@@ -96,12 +96,8 @@ open_file(){
     # Recording opening to the log
     echo "$file_path;$(date +%Y-%m-%d);$(date +%H-%M-%S);${group_list}${group}" >> "$MOLE_RC"
     # Opening the file 
-    ${EDITOR-${VISUAL-vi}} "$1"
-    # Checking if the file opened successfully(valid editor is set)
-    if [ ! $? -eq 0 ]; then
-        echo "Error: The editor specified wrongly. Cannot open the file. Please change the editor value" >&2
-        exit 1
-    fi
+    ${EDITOR-${VISUAL-vi}} "$1" 2>/dev/null
+    exit $?
 }
 
 # Function for filtering opening logs
@@ -114,6 +110,7 @@ filters(){
 
     # selecting files based on specified directory(if -r is set files from subdirectories are also selected)
     if [ -n "$directory" ]; then
+        directory=$(cd $directory; current_directory)
         if [ $recursive = true ]; then
             file=$(echo "$file" | awk -v dir="$directory" -F ';' '{path=$1; sub( /\/[^\/]*$/,"",path ); if(path ~ "^"dir){print}}')  
         else
@@ -153,7 +150,7 @@ filters(){
 
 # Function getting the relative path tot he file based on the specified directory
 relative_path(){
-    current_path=$1
+    current_path=$(cd $1; current_directory)
     file_path=$2
     echo "$file_path" | sed "s|^$current_path/||"
 }
@@ -177,6 +174,10 @@ if [ -n "$MOLE_RC" ]; then
     if [ ! -f "$MOLE_RC" ]; then 
         dir_root=$(dirname "$MOLE_RC")
         mkdir -p "$dir_root" && touch "$MOLE_RC"
+    fi
+    if [ ! -w "$MOLE_RC" ]; then
+        echo "Error: Log file does not have write permission" >&2
+        exit 1
     fi
 else
     echo "Error: Path to log file is not set" 1>&2
@@ -350,10 +351,9 @@ if [ -d "$1" -o -z "$1" ]; then
     for f in $file; do
 	    if [ -f "$f" ]; then
             open_file "$f"
-            exit 0
         fi
     done
-    echo "Error: Not a single file is found in the directory $directory with those options"
+    echo "Error: Not a single file is found in the directory $directory with those options" >&2
     exit 1
 else
     # If -m, -d, -r, -a, -b are set then argument must be directory
